@@ -1,8 +1,9 @@
 'use strict';
 // BlockNova friends & chat server. Run: `npm install && npm start` (PORT env, default 8787).
 // Protocol: JSON messages over WebSocket.
-//   client -> {t:'hello', name, key, badge} | {t:'friends', names} | {t:'presence', status, game} | {t:'chat', to, text}
+//   client -> {t:'hello', name, key, badge} | {t:'friends', names} | {t:'presence', status, game} | {t:'chat', to, text} | {t:'share', to, pack}
 //   server -> {t:'welcome', name, lobby} | {t:'presence', name, online, status, game, badge, mutual} | {t:'chat', from, to, text, ts}
+//             | {t:'share', from, pack, ts} (a modpack sent by a friend) | {t:'share-ok', to}
 //             | {t:'requests', names} (who added you but you have not added back) | {t:'error', code}
 const fs = require('fs');
 const path = require('path');
@@ -69,7 +70,28 @@ function broadcastPresence(st, online = true) {
   }
 }
 
+/** /join?s=&v=&p= — target of the Discord "Join" button: opens blocknova://join in the visitor's launcher. */
+function joinPage(url) {
+  const s = url.searchParams.get('s') || '';
+  if (!/^[A-Za-z0-9.\-]+(:\d{1,5})?$/.test(s)) return null;
+  const v = /^[\w.\-]{1,40}$/.test(url.searchParams.get('v') || '') ? url.searchParams.get('v') : '';
+  const p = clean(url.searchParams.get('p')).slice(0, 60);
+  const link = 'blocknova://join?' + new URLSearchParams({ s, v, p });
+  const data = JSON.stringify({ link, s, v, p }).replace(/</g, '\\u003c');
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>BlockNova — Join</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#05060f;color:#eef1ff;font:16px system-ui,sans-serif;text-align:center}
+.c{padding:32px;max-width:420px}h1{font-size:22px;margin:0 0 8px}p{color:#98a2c4}a.b{display:inline-block;margin-top:14px;padding:12px 22px;border-radius:12px;background:linear-gradient(120deg,#3ef08a,#2ad4ff);color:#04150b;font-weight:700;text-decoration:none}</style></head>
+<body><div class="c"><h1>Joining in BlockNova…</h1><p id="t"></p><a class="b" id="open" href="#">Open BlockNova</a><p style="margin-top:22px;font-size:13px">No launcher yet? <a id="dl" style="color:#3ef08a" href="https://github.com/FunPlazy/BlockNova-Launcher/releases/latest">Download BlockNova</a></p></div>
+<script>const d=${data};document.getElementById('t').textContent=d.s+(d.v?' · Minecraft '+d.v:'')+(d.p?' · '+d.p:'');document.getElementById('open').href=d.link;location.href=d.link;</script></body></html>`;
+}
+
 const server = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://x');
+  if (url.pathname === '/join') {
+    const page = joinPage(url);
+    res.writeHead(page ? 200 : 400, { 'Content-Type': page ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8' });
+    return res.end(page || 'Bad server address');
+  }
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
   res.end(`BlockNova friends server · online: ${clients.size}\n`);
 });
@@ -151,6 +173,28 @@ wss.on('connection', ws => {
         send(other.ws, msg);
         send(ws, msg);
       }
+      return;
+    }
+
+    // A modpack recipe (name, version, loader, Modrinth/CurseForge ids) sent to a mutual friend.
+    if (m.t === 'share') {
+      const now = Date.now();
+      if (now - st.lastChat < 1200) return send(ws, { t: 'error', code: 'slow_down' });
+      st.lastChat = now;
+      const other = clients.get(lc(clean(m.to)));
+      if (!other || !isMutual(st, other)) return send(ws, { t: 'error', code: 'not_friends' });
+      const p = m.pack && typeof m.pack === 'object' ? m.pack : {};
+      const pack = {
+        name: clean(p.name).slice(0, 40), gameVersion: clean(p.gameVersion).slice(0, 40),
+        loader: ['vanilla', 'fabric', 'quilt', 'forge', 'neoforge'].includes(p.loader) ? p.loader : 'vanilla',
+        mods: (Array.isArray(p.mods) ? p.mods : []).slice(0, 400)
+          .map(x => ({ s: x && x.s === 'c' ? 'c' : 'm', id: clean(x && x.id).slice(0, 40), title: clean(x && x.title).slice(0, 60) }))
+          .filter(x => /^[A-Za-z0-9_-]+$/.test(x.id)),
+        other: (Array.isArray(p.other) ? p.other : []).slice(0, 100).map(x => clean(x).slice(0, 60))
+      };
+      if (!pack.name || !pack.gameVersion) return;
+      send(other.ws, { t: 'share', from: st.name, pack, ts: now });
+      send(ws, { t: 'share-ok', to: other.name });
     }
   });
 
